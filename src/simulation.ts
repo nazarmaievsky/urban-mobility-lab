@@ -1,6 +1,6 @@
 // Евристична СИНТЕТИЧНА модель. Це не транспортна симуляція і не калібрована на реальних даних.
 // Ідея: BPR-функція затримки + логіт-розподіл витісненого потоку по об'їздах.
-import { Edge, Graph, LatLng, Path, alternativePaths, freeFlowSec, haversine } from "./graph";
+import { Edge, Graph, LatLng, Path, alternativePaths, freeFlowSec, haversine, shortestPath } from "./graph";
 
 export type TimeOfDay = "night" | "morning" | "day" | "evening" | "weekend";
 export const TIME_LABEL: Record<TimeOfDay, string> = {
@@ -26,8 +26,13 @@ export interface CriticalNode { nodeId: string; pos: LatLng; label: string; vc: 
 export interface SignalRec { pos: LatLng; label: string; text: string }
 export interface PoliceRec { pos: LatLng; label: string; reason: string }
 
+export interface DivergencePoint { pos: LatLng; label: string; share: number }
+
 export interface SimResult {
   synthetic: true;
+  mode: "od" | "local"; // od: перемаршрутизація умовних поїздок здалеку; local: лише обхід між кінцями ділянки
+  odCount: number;
+  divergence: DivergencePoint[];
   error?: string;
   closureEnds?: [string, string];
   flow: number; closedCap: number; displaced: number;
@@ -81,9 +86,58 @@ export function nodeLabel(g: Graph, nodeId: string): string {
 }
 
 const empty = (error: string): SimResult => ({
-  synthetic: true, error, flow: 0, closedCap: 0, displaced: 0, alternatives: [], hotEdges: [],
+  synthetic: true, mode: "local", odCount: 0, divergence: [], error, flow: 0, closedCap: 0, displaced: 0, alternatives: [], hotEdges: [],
   overloaded: 0, totalDelayVehH: 0, avgExtraMin: 0, critical: [], signals: [], police: [],
 });
+
+interface Group { path: Path; share: number; refTimeSec: number; refLen: number; diverge: string }
+
+function rng(seed: number) {
+  return () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Умовні поїздки "звідки-куди" з околиць входу й виходу ділянки. Ті, чий найкоротший шлях іде через
+ * перекриття, перемаршрутизуються. Об'їзд починається там, де новий маршрут розходиться зі старим.
+ */
+function rerouteGroups(g: Graph, closedSet: Set<string>, entry: string, exit: string): { total: number; list: Group[] } {
+  const rand = rng(42);
+  const around = (center: LatLng) =>
+    [...g.nodes].filter(([id, pos]) => g.out.has(id) && (() => { const d = haversine(pos, center); return d > 250 && d < 1800; })()).map(([id]) => id);
+  const origins = around(g.nodes.get(entry)!), dests = around(g.nodes.get(exit)!);
+  if (!origins.length || !dests.length) return { total: 0, list: [] };
+  const noBlock = new Set<string>(), noPen = new Map<string, number>();
+  const acc = new Map<string, { edges: Edge[]; n: number; refT: number; refL: number; diverge: string }>();
+  let affected = 0;
+  for (let k = 0; k < 500 && affected < 80; k++) {
+    const o = origins[Math.floor(rand() * origins.length)], d = dests[Math.floor(rand() * dests.length)];
+    if (o === d) continue;
+    const p0 = shortestPath(g, o, d, noBlock, noPen);
+    if (!p0 || !p0.edges.some((e) => closedSet.has(e.id))) continue;
+    const p1 = shortestPath(g, o, d, closedSet, noPen);
+    if (!p1) continue;
+    const oldIds = new Set(p0.edges.map((e) => e.id)), newIds = new Set(p1.edges.map((e) => e.id));
+    const newOnly = p1.edges.filter((e) => !oldIds.has(e.id));
+    if (!newOnly.length) continue;
+    const oldOnly = p0.edges.filter((e) => !newIds.has(e.id));
+    const sig = newOnly.map((e) => e.id).join("|");
+    const a = acc.get(sig) ?? {
+      edges: newOnly, n: 0, diverge: p1.nodes[p1.edges.findIndex((e) => !oldIds.has(e.id))],
+      refT: oldOnly.reduce((s, e) => s + freeFlowSec(e), 0), refL: oldOnly.reduce((s, e) => s + e.length, 0),
+    };
+    a.n++; acc.set(sig, a); affected++;
+  }
+  const list = [...acc.values()].sort((a, b) => b.n - a.n).map((a) => ({
+    path: { nodes: [], edges: a.edges, length: a.edges.reduce((s, e) => s + e.length, 0), timeSec: a.edges.reduce((s, e) => s + freeFlowSec(e), 0) },
+    share: a.n / affected, refTimeSec: a.refT, refLen: a.refL, diverge: a.diverge,
+  }));
+  return { total: affected, list };
+}
 
 export const HeuristicEngine: SimulationEngine = {
   name: "Heuristic BPR (synthetic)",
@@ -101,19 +155,23 @@ export const HeuristicEngine: SimulationEngine = {
     const displaced = Math.max(0, flow - remaining);
     const closedTimeSec = closedEdges.reduce((s, e) => s + freeFlowSec(e), 0);
 
-    // Об'їзд завжди шукаємо повз ділянку. При частковому перекритті частина потоку лишається на ній.
-    const paths = alternativePaths(g, s0, t0n, new Set(closed), 3);
-    if (!paths.length) return { ...empty("Об'їзд у межах завантаженої мережі не знайдено. Спробуй іншу ділянку."), closureEnds: [s0, t0n], flow, closedCap, displaced };
-
-    // Логіт: швидші об'їзди отримують більшу частку витісненого потоку.
-    const t0 = paths[0].timeSec;
-    const w = paths.map((pt) => Math.exp(-4 * (pt.timeSec / t0 - 1)));
-    const wSum = w.reduce((a, b) => a + b, 0);
-    const shares = w.map((x) => x / wSum);
+    // Основний режим: перемаршрутизація умовних поїздок здалеку. Запасний: локальний обхід між кінцями ділянки.
+    const closedLen = closedEdges.reduce((s, e) => s + e.length, 0);
+    let { total: odCount, list } = rerouteGroups(g, new Set(closed), s0, t0n);
+    let mode: "od" | "local" = "od";
+    if (odCount < 5) {
+      mode = "local"; odCount = 0;
+      const paths = alternativePaths(g, s0, t0n, new Set(closed), 3);
+      if (!paths.length) return { ...empty("Об'їзд у межах завантаженої мережі не знайдено. Спробуй іншу ділянку."), closureEnds: [s0, t0n], flow, closedCap, displaced };
+      // Логіт: швидші об'їзди отримують більшу частку витісненого потоку.
+      const w = paths.map((pt) => Math.exp(-4 * (pt.timeSec / paths[0].timeSec - 1)));
+      const wSum = w.reduce((x, y) => x + y, 0);
+      list = paths.map((pt, i) => ({ path: pt, share: w[i] / wSum, refTimeSec: closedTimeSec, refLen: closedLen, diverge: s0 }));
+    }
 
     const load = new Map<string, { e: Edge; bg: number; add: number; cap: number }>();
-    paths.forEach((pt, i) => {
-      for (const e of pt.edges) {
+    for (const gr of list) {
+      for (const e of gr.path.edges) {
         let r = load.get(e.id);
         if (!r) {
           const cap = edgeCap(e, p);
@@ -121,9 +179,9 @@ export const HeuristicEngine: SimulationEngine = {
           r = { e, bg, add: 0, cap };
           load.set(e.id, r);
         }
-        r.add += displaced * shares[i];
+        r.add += displaced * gr.share;
       }
-    });
+    }
     const vcTot = (id: string) => { const r = load.get(id)!; return (r.bg + r.add) / r.cap; };
 
     let totalDelaySec = 0, overloaded = 0;
@@ -134,16 +192,20 @@ export const HeuristicEngine: SimulationEngine = {
       if (r.add > 0 && (r.bg + r.add) / r.cap > 0.9) { overloaded++; hotEdges.push(r.e); }
     }
 
-    const alternatives: AltResult[] = paths.map((pt, i) => {
-      const congSec = pt.edges.reduce((s, e) => s + bpr(freeFlowSec(e), vcTot(e.id)), 0);
-      return {
-        index: i, path: pt, share: shares[i], color: ALT_COLORS[i % ALT_COLORS.length],
-        extraKm: (pt.length - closedEdges.reduce((s, e) => s + e.length, 0)) / 1000,
-        extraMin: (congSec - closedTimeSec) / 60,
-        maxVc: Math.max(...pt.edges.map((e) => vcTot(e.id))),
-      };
-    });
-    const avgExtraMin = alternatives.reduce((s, a) => s + a.share * a.extraMin, 0);
+    const extraMinOf = (gr: Group) =>
+      (gr.path.edges.reduce((s, e) => s + bpr(freeFlowSec(e), vcTot(e.id)), 0) - gr.refTimeSec) / 60;
+    const alternatives: AltResult[] = list.slice(0, 3).map((gr, i) => ({
+      index: i, path: gr.path, share: gr.share, color: ALT_COLORS[i % ALT_COLORS.length],
+      extraKm: (gr.path.length - gr.refLen) / 1000,
+      extraMin: extraMinOf(gr),
+      maxVc: Math.max(...gr.path.edges.map((e) => vcTot(e.id))),
+    }));
+    const avgExtraMin = list.reduce((s, gr) => s + gr.share * extraMinOf(gr), 0);
+
+    const dv = new Map<string, number>();
+    for (const gr of list) dv.set(gr.diverge, (dv.get(gr.diverge) ?? 0) + gr.share);
+    const divergence: DivergencePoint[] = [...dv].sort((a, b) => b[1] - a[1]).slice(0, 3)
+      .map(([n, share]) => ({ pos: g.nodes.get(n)!, label: nodeLabel(g, n), share }));
 
     // Вузли на об'їздах з найвищим v/c на інцидентних ребрах.
     const nodeVc = new Map<string, number>();
@@ -173,12 +235,14 @@ export const HeuristicEngine: SimulationEngine = {
       .filter((c) => c.vc >= 0.95 || ((g.adj.get(c.nodeId)?.length ?? 0) >= 4 && c.vc >= 0.85))
       .map((c) => ({ pos: c.pos, label: c.label, reason: `v/c ≈ ${c.vc.toFixed(2)}: розглянути ручне регулювання в піковий час.` }));
     if (displaced > 0) {
-      police.unshift({ pos: g.nodes.get(s0)!, label: nodeLabel(g, s0), reason: "Початок об'їзду: контроль дотримання перекриття і навігація водіїв." });
+      for (const d of divergence.slice(0, 2).reverse()) {
+        police.unshift({ pos: d.pos, label: d.label, reason: `Точка розгалуження об'їзду (~${Math.round(d.share * 100)}% об'їжджаючих): знаки, табло або регулювальник.` });
+      }
     }
 
     police = thin(police, 200).slice(0, 4);
 
-    return { synthetic: true, closureEnds: [s0, t0n], flow, closedCap, displaced, alternatives, hotEdges,
+    return { synthetic: true, mode, odCount, divergence, closureEnds: [s0, t0n], flow, closedCap, displaced, alternatives, hotEdges,
       overloaded, totalDelayVehH: totalDelaySec / 3600, avgExtraMin, critical, signals, police };
   },
 };
