@@ -85,6 +85,10 @@ export default function MapView({ graph, selected, onToggle, result }: Props) {
       L.circleMarker(c.pos, { radius: 9, color: "#b45309", weight: 3, fillColor: "#f59e0b", fillOpacity: 0.9 })
         .bindTooltip(`${c.label}<br/>v/c ≈ ${c.vc.toFixed(2)}`).addTo(layer);
     }
+    for (const d of result.divergence) {
+      L.marker(d.pos, { icon: pin("🔀") }).bindTooltip(`Початок об'їзду: ${d.label}<br/>~${Math.round(d.share * 100)}% об'їжджаючих`).addTo(layer);
+      bounds.extend(d.pos);
+    }
     for (const s of result.signals) L.marker(s.pos, { icon: pin("🚦"), interactive: false }).addTo(layer);
     for (const p of result.police) {
       L.marker(p.pos, { icon: pin("👮") }).bindTooltip(`${p.label}<br/>${p.reason}`).addTo(layer);
