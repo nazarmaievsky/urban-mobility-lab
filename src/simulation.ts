@@ -1,6 +1,6 @@
 // Евристична СИНТЕТИЧНА модель. Це не транспортна симуляція і не калібрована на реальних даних.
 // Ідея: BPR-функція затримки + логіт-розподіл витісненого потоку по об'їздах.
-import { Edge, Graph, LatLng, Path, alternativePaths, freeFlowSec, otherEnd } from "./graph";
+import { Edge, Graph, LatLng, Path, alternativePaths, freeFlowSec, haversine } from "./graph";
 
 export type TimeOfDay = "night" | "morning" | "day" | "evening" | "weekend";
 export const TIME_LABEL: Record<TimeOfDay, string> = {
@@ -59,6 +59,22 @@ export function closureEndpoints(edges: Edge[]): string[] {
   return [...c].filter(([, n]) => n === 1).map(([n]) => n);
 }
 
+/** Для односторонньої ділянки: [вхід, вихід] за напрямком руху. */
+function orderEnds(edges: Edge[], [a, b]: string[]): [string, string] {
+  const inc = (n: string) => edges.find((e) => e.from === n || e.to === n)!;
+  const ea = inc(a), eb = inc(b);
+  if (ea.oneway) return ea.from === a ? [a, b] : [b, a];
+  if (eb.oneway) return eb.from === b ? [b, a] : [a, b];
+  return [a, b];
+}
+
+/** Прибирає маркери, що лежать ближче за minM метрів до вже залишених. */
+function thin<T extends { pos: LatLng }>(items: T[], minM: number): T[] {
+  const kept: T[] = [];
+  for (const it of items) if (kept.every((k) => haversine(k.pos, it.pos) >= minM)) kept.push(it);
+  return kept;
+}
+
 export function nodeLabel(g: Graph, nodeId: string): string {
   const names = [...new Set((g.adj.get(nodeId) ?? []).map((e) => e.name))].slice(0, 2);
   return names.length > 1 ? `${names[0]} / ${names[1]}` : names[0] ?? "перехрестя";
@@ -77,6 +93,7 @@ export const HeuristicEngine: SimulationEngine = {
     const ends = closureEndpoints(closedEdges);
     if (ends.length !== 2) return empty("Ділянка має бути суцільною (без розривів і розгалужень). Очисти вибір і познач її заново.");
 
+    const [s0, t0n] = orderEnds(closedEdges, ends);
     const mult = TIME_MULT[p.time];
     const flow = p.demand * mult;
     const closedCap = Math.min(...closedEdges.map((e) => edgeCap(e, p)));
@@ -85,8 +102,8 @@ export const HeuristicEngine: SimulationEngine = {
     const closedTimeSec = closedEdges.reduce((s, e) => s + freeFlowSec(e), 0);
 
     // Об'їзд завжди шукаємо повз ділянку. При частковому перекритті частина потоку лишається на ній.
-    const paths = alternativePaths(g, ends[0], ends[1], new Set(closed), 3);
-    if (!paths.length) return { ...empty("Об'їзд у межах завантаженої мережі не знайдено. Спробуй іншу ділянку."), closureEnds: [ends[0], ends[1]], flow, closedCap, displaced };
+    const paths = alternativePaths(g, s0, t0n, new Set(closed), 3);
+    if (!paths.length) return { ...empty("Об'їзд у межах завантаженої мережі не знайдено. Спробуй іншу ділянку."), closureEnds: [s0, t0n], flow, closedCap, displaced };
 
     // Логіт: швидші об'їзди отримують більшу частку витісненого потоку.
     const t0 = paths[0].timeSec;
@@ -134,10 +151,13 @@ export const HeuristicEngine: SimulationEngine = {
       const vc = (r.bg + r.add) / r.cap;
       for (const n of [r.e.from, r.e.to]) nodeVc.set(n, Math.max(nodeVc.get(n) ?? 0, vc));
     }
-    const critical: CriticalNode[] = [...nodeVc]
-      .filter(([, vc]) => vc >= 0.75)
-      .sort((a, b) => b[1] - a[1]).slice(0, 5)
-      .map(([nodeId, vc]) => ({ nodeId, pos: g.nodes.get(nodeId)!, label: nodeLabel(g, nodeId), vc, hasSignal: g.signals.has(nodeId) }));
+    const critical: CriticalNode[] = thin(
+      [...nodeVc]
+        .filter(([, vc]) => vc >= 0.75)
+        .sort((a, b) => b[1] - a[1])
+        .map(([nodeId, vc]) => ({ nodeId, pos: g.nodes.get(nodeId)!, label: nodeLabel(g, nodeId), vc, hasSignal: g.signals.has(nodeId) })),
+      120
+    ).slice(0, 5);
 
     const signals: SignalRec[] = critical.map((c) => {
       const delta = clamp(Math.round((c.vc - 0.75) * 40), 4, 20);
@@ -149,14 +169,16 @@ export const HeuristicEngine: SimulationEngine = {
       };
     });
 
-    const police: PoliceRec[] = critical
+    let police: PoliceRec[] = critical
       .filter((c) => c.vc >= 0.95 || ((g.adj.get(c.nodeId)?.length ?? 0) >= 4 && c.vc >= 0.85))
       .map((c) => ({ pos: c.pos, label: c.label, reason: `v/c ≈ ${c.vc.toFixed(2)}: розглянути ручне регулювання в піковий час.` }));
     if (displaced > 0) {
-      police.unshift({ pos: g.nodes.get(ends[0])!, label: nodeLabel(g, ends[0]), reason: "Початок об'їзду: контроль дотримання перекриття і навігація водіїв." });
+      police.unshift({ pos: g.nodes.get(s0)!, label: nodeLabel(g, s0), reason: "Початок об'їзду: контроль дотримання перекриття і навігація водіїв." });
     }
 
-    return { synthetic: true, closureEnds: [ends[0], ends[1]], flow, closedCap, displaced, alternatives, hotEdges,
+    police = thin(police, 200).slice(0, 4);
+
+    return { synthetic: true, closureEnds: [s0, t0n], flow, closedCap, displaced, alternatives, hotEdges,
       overloaded, totalDelayVehH: totalDelaySec / 3600, avgExtraMin, critical, signals, police };
   },
 };
