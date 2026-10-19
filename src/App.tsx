@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import MapView from "./MapView";
-import { Graph, otherEnd } from "./graph";
-import { loadGraph, osrmBaselineMinutes } from "./roadNetwork";
+import { Graph, buildGraph } from "./graph";
+import { demoOsm } from "./demoGraph";
+import { MAP_CENTER, loadGraph, osrmBaselineMinutes } from "./roadNetwork";
 import {
   HeuristicEngine, Params, SimResult, TIME_LABEL, TimeOfDay, closureEndpoints,
 } from "./simulation";
@@ -18,9 +19,10 @@ export default function App() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [result, setResult] = useState<SimResult | null>(null);
   const [osrmMin, setOsrmMin] = useState<number | null>(null);
+  const [isDemo, setIsDemo] = useState(false);
 
   const load = useCallback(async (force: boolean) => {
-    setError(null); setGraph(null); setResult(null); setSelected(new Set());
+    setError(null); setGraph(null); setResult(null); setSelected(new Set()); setIsDemo(false);
     setStatus("Завантажую вулиці Львова з OpenStreetMap…");
     try {
       const { graph, fromCache } = await loadGraph(force);
@@ -31,6 +33,12 @@ export default function App() {
     }
   }, []);
   useEffect(() => { load(false); }, [load]);
+
+  const showDemo = () => {
+    const g = buildGraph(demoOsm(MAP_CENTER));
+    setError(null); setResult(null); setSelected(new Set()); setIsDemo(true); setGraph(g);
+    setStatus(`Демо-мережа: синтетична геометрія (не реальні вулиці), ${g.edges.length} сегментів`);
+  };
 
   const toggle = useCallback((id: string) => {
     setResult(null);
@@ -66,7 +74,7 @@ export default function App() {
     const r = engine.run({ graph, closed: [...selected], params });
     setResult(r);
     setOsrmMin(null);
-    if (!r.error && r.closureEnds) {
+    if (!isDemo && !r.error && r.closureEnds) {
       osrmBaselineMinutes(graph.nodes.get(r.closureEnds[0])!, graph.nodes.get(r.closureEnds[1])!).then(setOsrmMin);
     }
   };
@@ -84,10 +92,14 @@ export default function App() {
         <section>
           <h2>1. Ділянка перекриття</h2>
           {error ? (
-            <p className="err">{error} <button className="link" onClick={() => load(true)}>Спробувати ще раз</button></p>
+            <p className="err">{error}</p>
           ) : (
             <p className="muted">{status}</p>
           )}
+          <div className="row">
+            {error && <button onClick={() => load(true)}>Спробувати ще раз</button>}
+            <button onClick={showDemo}>Демо-мережа (без інтернету)</button>
+          </div>
           {closedEdges.length === 0 ? (
             <p>Клікни на вулицю на карті. Повторний клік знімає сегмент.</p>
           ) : (
@@ -145,6 +157,15 @@ function Results({ result: r, osrmMin }: { result: SimResult; osrmMin: number | 
         <div><dt>Перевантажені сегменти</dt><dd>{r.overloaded}</dd></div>
       </dl>
 
+      <p className="muted">
+        {r.mode === "od"
+          ? `Об'їзди розраховано для ${r.odCount} умовних поїздок «звідки-куди» з околиць ділянки: водії розходяться зі звичного маршруту там, де об'їзд починається, а не лише біля самого перекриття.`
+          : "Умовних поїздок через ділянку замало, тому показано лише локальний обхід між кінцями ділянки."}
+      </p>
+      {r.divergence.length > 0 && (<>
+        <h3>Де об'їзд має починатися 🔀</h3>
+        <ul>{r.divergence.map((d, i) => <li key={i}><b>{d.label}</b>: ~{Math.round(d.share * 100)}% об'їжджаючих</li>)}</ul>
+      </>)}
       <h3>Варіанти об'їзду</h3>
       <table>
         <thead><tr><th></th><th>Частка</th><th>+км</th><th>+хв</th><th>макс v/c</th></tr></thead>
