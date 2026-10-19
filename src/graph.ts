@@ -11,6 +11,7 @@ export interface Edge {
   name: string;
   lanes: number; // смуг в одному напрямку (оцінка)
   speedKmh: number; // умовна швидкість вільного потоку
+  oneway: boolean; // true: рух лише від from до to
 }
 
 export interface Graph {
@@ -18,19 +19,20 @@ export interface Graph {
   signals: Set<string>; // вузли з highway=traffic_signals в OSM
   edges: Edge[];
   edgeById: Map<string, Edge>;
-  adj: Map<string, Edge[]>;
+  adj: Map<string, Edge[]>; // усі інцидентні ребра (без урахування напрямку)
+  out: Map<string, Edge[]>; // ребра, якими можна виїхати з вузла
 }
 
 // Компактний формат (його ж кешуємо в localStorage)
 export interface CompactOsm {
   nodes: [string, number, number, 0 | 1][]; // id, lat, lon, signal
-  ways: { id: string; nodes: string[]; hw: string; name: string; lanes: number; oneway: boolean }[];
+  ways: { id: string; nodes: string[]; hw: string; name: string; lanes: number; oneway: 0 | 1 | -1 }[]; // -1: односторонній проти напрямку вузлів
 }
 
 const SPEED: Record<string, number> = { trunk: 60, primary: 50, secondary: 50, tertiary: 40, unclassified: 40, residential: 30 };
 const LANES: Record<string, number> = { trunk: 2, primary: 2, secondary: 1, tertiary: 1, unclassified: 1, residential: 1 };
 
-function haversine(a: LatLng, b: LatLng): number {
+export function haversine(a: LatLng, b: LatLng): number {
   const R = 6371000, rad = Math.PI / 180;
   const dLat = (b[0] - a[0]) * rad, dLon = (b[1] - a[1]) * rad;
   const s = Math.sin(dLat / 2) ** 2 + Math.cos(a[0] * rad) * Math.cos(b[0] * rad) * Math.sin(dLon / 2) ** 2;
@@ -50,21 +52,22 @@ export function buildGraph(osm: CompactOsm): Graph {
 
   const edges: Edge[] = [];
   for (const w of osm.ways) {
+    const wn = w.oneway === -1 ? [...w.nodes].reverse() : w.nodes;
     let start = 0;
     let k = 0;
-    for (let i = 1; i < w.nodes.length; i++) {
-      const isCut = i === w.nodes.length - 1 || (uses.get(w.nodes[i]) ?? 0) > 1;
+    for (let i = 1; i < wn.length; i++) {
+      const isCut = i === wn.length - 1 || (uses.get(wn[i]) ?? 0) > 1;
       if (!isCut) continue;
-      const ids = w.nodes.slice(start, i + 1);
+      const ids = wn.slice(start, i + 1);
       const coords = ids.map((n) => nodes.get(n)).filter((c): c is LatLng => !!c);
       const from = ids[0], to = ids[ids.length - 1];
       if (coords.length === ids.length && from !== to) {
         let length = 0;
         for (let j = 1; j < coords.length; j++) length += haversine(coords[j - 1], coords[j]);
-        const lanes = w.lanes > 0 ? (w.oneway ? w.lanes : Math.max(1, Math.ceil(w.lanes / 2))) : LANES[w.hw] ?? 1;
+        const lanes = w.lanes > 0 ? (w.oneway !== 0 ? w.lanes : Math.max(1, Math.ceil(w.lanes / 2))) : LANES[w.hw] ?? 1;
         edges.push({
           id: `${w.id}_${k}`, from, to, coords, length, highway: w.hw,
-          name: w.name || w.hw, lanes, speedKmh: SPEED[w.hw] ?? 30,
+          name: w.name || w.hw, lanes, speedKmh: SPEED[w.hw] ?? 30, oneway: w.oneway !== 0,
         });
       }
       k++;
@@ -73,13 +76,17 @@ export function buildGraph(osm: CompactOsm): Graph {
   }
   const edgeById = new Map(edges.map((e) => [e.id, e]));
   const adj = new Map<string, Edge[]>();
+  const out = new Map<string, Edge[]>();
+  const add = (m: Map<string, Edge[]>, n: string, e: Edge) => {
+    if (!m.has(n)) m.set(n, []);
+    m.get(n)!.push(e);
+  };
   for (const e of edges) {
-    for (const n of [e.from, e.to]) {
-      if (!adj.has(n)) adj.set(n, []);
-      adj.get(n)!.push(e);
-    }
+    add(adj, e.from, e); add(adj, e.to, e);
+    add(out, e.from, e);
+    if (!e.oneway) add(out, e.to, e);
   }
-  return { nodes, signals, edges, edgeById, adj };
+  return { nodes, signals, edges, edgeById, adj, out };
 }
 
 export const otherEnd = (e: Edge, n: string) => (e.from === n ? e.to : e.from);
@@ -130,7 +137,7 @@ export function shortestPath(
     const [d, u] = h.pop()!;
     if (d > (dist.get(u) ?? Infinity)) continue;
     if (u === dst) break;
-    for (const e of g.adj.get(u) ?? []) {
+    for (const e of g.out.get(u) ?? []) {
       if (blocked.has(e.id)) continue;
       const v = otherEnd(e, u);
       const nd = d + freeFlowSec(e) * (penalty.get(e.id) ?? 1);
