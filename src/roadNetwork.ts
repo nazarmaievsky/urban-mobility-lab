@@ -2,7 +2,7 @@ import { buildGraph, CompactOsm, Graph, LatLng } from "./graph";
 
 export const MAP_CENTER: LatLng = [49.8419, 24.0315]; // Львів, центр
 const BBOX = "49.832,24.010,49.850,24.045"; // south,west,north,east
-const CACHE_KEY = "uml-lviv-osm-v1";
+const CACHE_KEY = "uml-lviv-osm-v2";
 const OVERPASS = [
   "https://overpass-api.de/api/interpreter",
   "https://overpass.kumi.systems/api/interpreter",
@@ -28,7 +28,8 @@ function toCompact(json: any): CompactOsm {
         hw: el.tags.highway,
         name: el.tags.name || el.tags.ref || "",
         lanes: parseInt(el.tags.lanes, 10) || 0,
-        oneway: el.tags.oneway === "yes",
+        oneway: ["-1", "reverse"].includes(String(el.tags.oneway)) ? -1
+          : ["yes", "1", "true"].includes(String(el.tags.oneway)) || el.tags.junction === "roundabout" ? 1 : 0,
       });
     }
   }
